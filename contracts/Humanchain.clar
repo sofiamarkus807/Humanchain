@@ -10,6 +10,14 @@
 (define-constant ERR-BADGE-ALREADY-EARNED (err u109))
 (define-constant ERR-INVALID-BADGE-TYPE (err u110))
 (define-constant ERR-NO-REWARDS-AVAILABLE (err u111))
+(define-constant ERR-DISPUTE-EXISTS (err u112))
+(define-constant ERR-DISPUTE-NOT-FOUND (err u113))
+(define-constant ERR-DISPUTE-EXPIRED (err u114))
+(define-constant ERR-DISPUTE-RESOLVED (err u115))
+(define-constant ERR-ALREADY-VOTED (err u116))
+(define-constant ERR-INSUFFICIENT-STAKE (err u117))
+(define-constant ERR-SELF-DISPUTE (err u118))
+(define-constant ERR-INSUFFICIENT-VOTING-POWER (err u119))
 
 (define-constant REQUIRED_VOUCHES u3)
 (define-constant COOLING_PERIOD u144)
@@ -29,10 +37,20 @@
 (define-constant TIER-GOLD u3)
 (define-constant TIER-PLATINUM u4)
 
+(define-constant DISPUTE_STAKE u200)
+(define-constant DISPUTE_DURATION u1008)
+(define-constant MIN_VOTING_POWER u50)
+(define-constant DISPUTE-STATUS-PENDING u1)
+(define-constant DISPUTE-STATUS-RESOLVED-GUILTY u2)
+(define-constant DISPUTE-STATUS-RESOLVED-INNOCENT u3)
+(define-constant DISPUTE-STATUS-EXPIRED u4)
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-humans uint u0)
 (define-data-var total-reputation-pool uint u0)
 (define-data-var rewards-distributed uint u0)
+(define-data-var total-disputes uint u0)
+(define-data-var active-disputes uint u0)
 
 (define-map registered-humans principal 
   {
@@ -70,6 +88,41 @@
     last-claim: uint,
     total-claimed: uint,
     consecutive-days: uint
+  }
+)
+
+(define-map disputes uint
+  {
+    accused: principal,
+    accuser: principal,
+    created-at: uint,
+    expires-at: uint,
+    status: uint,
+    stake-amount: uint,
+    guilty-votes: uint,
+    innocent-votes: uint,
+    total-voters: uint,
+    evidence-hash: (buff 32)
+  }
+)
+
+(define-map dispute-votes
+  { dispute-id: uint, voter: principal }
+  { 
+    vote: bool,
+    voting-power: uint,
+    voted-at: uint
+  }
+)
+
+(define-map dispute-history principal
+  {
+    total-accusations: uint,
+    total-disputes-won: uint,
+    total-disputes-lost: uint,
+    reputation-penalty: uint,
+    is-suspended: bool,
+    suspension-end: uint
   }
 )
 
@@ -417,3 +470,203 @@
     rewards-distributed: (var-get rewards-distributed)
   })
 )
+
+(define-public (create-dispute (accused principal) (evidence-hash (buff 32)))
+  (let 
+    (
+      (sender tx-sender)
+      (dispute-id (+ (var-get total-disputes) u1))
+      (current-rep (calculate-decayed-points sender))
+      (accused-history (default-to 
+        { 
+          total-accusations: u0, 
+          total-disputes-won: u0, 
+          total-disputes-lost: u0, 
+          reputation-penalty: u0,
+          is-suspended: false,
+          suspension-end: u0 
+        } 
+        (map-get? dispute-history accused)
+      ))
+    )
+    (asserts! (not (is-eq sender accused)) ERR-SELF-DISPUTE)
+    (asserts! (is-registered sender) ERR-NOT-REGISTERED)
+    (asserts! (is-registered accused) ERR-NOT-REGISTERED)
+    (asserts! (>= current-rep MIN_VOTING_POWER) ERR-INSUFFICIENT-VOTING-POWER)
+    (asserts! (not (is-suspended accused)) ERR-DISPUTE-EXISTS)
+    
+    (try! (stx-transfer? DISPUTE_STAKE sender (as-contract tx-sender)))
+    
+    (map-set disputes dispute-id
+      {
+        accused: accused,
+        accuser: sender,
+        created-at: stacks-block-height,
+        expires-at: (+ stacks-block-height DISPUTE_DURATION),
+        status: DISPUTE-STATUS-PENDING,
+        stake-amount: DISPUTE_STAKE,
+        guilty-votes: u0,
+        innocent-votes: u0,
+        total-voters: u0,
+        evidence-hash: evidence-hash
+      }
+    )
+    
+    (map-set dispute-history accused
+      (merge accused-history
+        { total-accusations: (+ (get total-accusations accused-history) u1) }
+      )
+    )
+    
+    (var-set total-disputes dispute-id)
+    (var-set active-disputes (+ (var-get active-disputes) u1))
+    (ok dispute-id)
+  )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-guilty bool))
+  (let 
+    (
+      (sender tx-sender)
+      (dispute-data (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+      (voter-rep (calculate-decayed-points sender))
+      (voting-key { dispute-id: dispute-id, voter: sender })
+      (current-votes (get total-voters dispute-data))
+      (current-guilty (get guilty-votes dispute-data))
+      (current-innocent (get innocent-votes dispute-data))
+    )
+    (asserts! (is-registered sender) ERR-NOT-REGISTERED)
+    (asserts! (>= voter-rep MIN_VOTING_POWER) ERR-INSUFFICIENT-VOTING-POWER)
+    (asserts! (is-eq (get status dispute-data) DISPUTE-STATUS-PENDING) ERR-DISPUTE-RESOLVED)
+    (asserts! (< stacks-block-height (get expires-at dispute-data)) ERR-DISPUTE-EXPIRED)
+    (asserts! (is-none (map-get? dispute-votes voting-key)) ERR-ALREADY-VOTED)
+    
+    (map-set dispute-votes voting-key
+      {
+        vote: vote-guilty,
+        voting-power: voter-rep,
+        voted-at: stacks-block-height
+      }
+    )
+    
+    (map-set disputes dispute-id
+      (merge dispute-data
+        {
+          guilty-votes: (if vote-guilty (+ current-guilty voter-rep) current-guilty),
+          innocent-votes: (if vote-guilty current-innocent (+ current-innocent voter-rep)),
+          total-voters: (+ current-votes u1)
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let 
+    (
+      (dispute-data (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+      (accused (get accused dispute-data))
+      (accuser (get accuser dispute-data))
+      (guilty-votes (get guilty-votes dispute-data))
+      (innocent-votes (get innocent-votes dispute-data))
+      (total-votes (+ guilty-votes innocent-votes))
+      (is-guilty (> guilty-votes innocent-votes))
+      (stake-amount (get stake-amount dispute-data))
+      (accused-history (default-to 
+        { 
+          total-accusations: u0, 
+          total-disputes-won: u0, 
+          total-disputes-lost: u0, 
+          reputation-penalty: u0,
+          is-suspended: false,
+          suspension-end: u0 
+        } 
+        (map-get? dispute-history accused)
+      ))
+      (new-status (if (>= stacks-block-height (get expires-at dispute-data))
+                    DISPUTE-STATUS-EXPIRED
+                    (if is-guilty DISPUTE-STATUS-RESOLVED-GUILTY DISPUTE-STATUS-RESOLVED-INNOCENT)))
+    )
+    (asserts! (is-eq (get status dispute-data) DISPUTE-STATUS-PENDING) ERR-DISPUTE-RESOLVED)
+    (asserts! (or 
+      (>= stacks-block-height (get expires-at dispute-data))
+      (>= total-votes u10)
+    ) ERR-DISPUTE-NOT-FOUND)
+    
+    (map-set disputes dispute-id
+      (merge dispute-data { status: new-status })
+    )
+    
+    (if (is-eq new-status DISPUTE-STATUS-RESOLVED-GUILTY)
+      (begin
+        (map-set dispute-history accused
+          (merge accused-history
+            {
+              total-disputes-lost: (+ (get total-disputes-lost accused-history) u1),
+              reputation-penalty: (+ (get reputation-penalty accused-history) u100),
+              is-suspended: true,
+              suspension-end: (+ stacks-block-height COOLING_PERIOD)
+            }
+          )
+        )
+        (try! (stx-transfer? (/ stake-amount u2) (as-contract tx-sender) accuser))
+        (unwrap-panic (distribute-voter-rewards dispute-id stake-amount true))
+      )
+      (begin
+        (map-set dispute-history accused
+          (merge accused-history
+            { total-disputes-won: (+ (get total-disputes-won accused-history) u1) }
+          )
+        )
+        (try! (stx-transfer? stake-amount (as-contract tx-sender) accuser))
+        (unwrap-panic (distribute-voter-rewards dispute-id u0 false))
+      )
+    )
+    
+    (var-set active-disputes (- (var-get active-disputes) u1))
+    (ok new-status)
+  )
+)
+
+(define-private (distribute-voter-rewards (dispute-id uint) (reward-pool uint) (guilty-won bool))
+  (begin
+    (ok true)
+  )
+)
+
+
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes dispute-id)
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+  (map-get? dispute-votes { dispute-id: dispute-id, voter: voter })
+)
+
+(define-read-only (get-dispute-history (human principal))
+  (map-get? dispute-history human)
+)
+
+(define-read-only (is-suspended (human principal))
+  (match (map-get? dispute-history human)
+    history
+      (and 
+        (get is-suspended history)
+        (> (get suspension-end history) stacks-block-height)
+      )
+    false
+  )
+)
+
+(define-read-only (get-dispute-stats)
+  (ok {
+    total-disputes: (var-get total-disputes),
+    active-disputes: (var-get active-disputes)
+  })
+)
+
+
+
