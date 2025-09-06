@@ -51,6 +51,7 @@
 (define-data-var rewards-distributed uint u0)
 (define-data-var total-disputes uint u0)
 (define-data-var active-disputes uint u0)
+(define-data-var total-activity-checkins uint u0)
 
 (define-map registered-humans principal 
   {
@@ -123,6 +124,16 @@
     reputation-penalty: uint,
     is-suspended: bool,
     suspension-end: uint
+  }
+)
+
+(define-map human-activity-tracking principal
+  {
+    last-activity-checkin: uint,
+    total-activity-checkins: uint,
+    consecutive-activity-checkins: uint,
+    longest-activity-streak: uint,
+    activity-score: uint
   }
 )
 
@@ -668,5 +679,83 @@
   })
 )
 
+;; Human Activity Verification System
+(define-public (activity-checkin)
+  (let 
+    (
+      (sender tx-sender)
+      (current-block stacks-block-height)
+      (activity-data (default-to 
+        {
+          last-activity-checkin: u0,
+          total-activity-checkins: u0,
+          consecutive-activity-checkins: u0,
+          longest-activity-streak: u0,
+          activity-score: u0
+        }
+        (map-get? human-activity-tracking sender)
+      ))
+      (blocks-since-last (if (is-eq (get last-activity-checkin activity-data) u0) u0 (- current-block (get last-activity-checkin activity-data))))
+      (is-consecutive (or (is-eq (get last-activity-checkin activity-data) u0) (<= blocks-since-last u1008)))
+      (new-consecutive (if is-consecutive (+ (get consecutive-activity-checkins activity-data) u1) u1))
+      (new-longest (if (> new-consecutive (get longest-activity-streak activity-data)) new-consecutive (get longest-activity-streak activity-data)))
+    )
+    (asserts! (is-registered sender) ERR-NOT-REGISTERED)
+    
+    ;; Update activity tracking data
+    (map-set human-activity-tracking sender
+      (merge activity-data
+        {
+          last-activity-checkin: current-block,
+          total-activity-checkins: (+ (get total-activity-checkins activity-data) u1),
+          consecutive-activity-checkins: new-consecutive,
+          longest-activity-streak: new-longest,
+          activity-score: (+ (get activity-score activity-data) (calculate-activity-points new-consecutive))
+        }
+      )
+    )
+    
+    ;; Update global counter
+    (var-set total-activity-checkins (+ (var-get total-activity-checkins) u1))
+    
+    ;; Award reputation points for consistent activity
+    (unwrap-panic (award-reputation-points sender (calculate-activity-points new-consecutive)))
+    (ok new-consecutive)
+  )
+)
 
+(define-private (calculate-activity-points (consecutive uint))
+  (if (> consecutive u30) u25
+    (if (> consecutive u14) u20
+      (if (> consecutive u7) u15
+        (if (> consecutive u3) u10
+          u5
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-human-activity (human principal))
+  (map-get? human-activity-tracking human)
+)
+
+(define-read-only (is-human-recently-active (human principal))
+  (match (map-get? human-activity-tracking human)
+    activity-data
+    (let 
+      (
+        (blocks-since-checkin (- stacks-block-height (get last-activity-checkin activity-data)))
+      )
+      (<= blocks-since-checkin u1008)
+    )
+    false
+  )
+)
+
+(define-read-only (get-activity-stats)
+  (ok {
+    total-activity-checkins: (var-get total-activity-checkins)
+  })
+)
 
